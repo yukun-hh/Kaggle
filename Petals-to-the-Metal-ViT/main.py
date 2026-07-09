@@ -53,11 +53,28 @@ class TFRecordToPyTorch(IterableDataset):
             id_torch = idd
             yield image_tensor, label_torch,id_torch
 
-# 使用
+
+
+# %%
+from transformers import ViTForImageClassification, ViTImageProcessor
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ 
+
+model_name = "google/vit-base-patch16-224-in21k"  # 在ImageNet21k上预训练
+
+model = ViTForImageClassification.from_pretrained(model_name, num_labels=104)
+ 
+model.to(device)
+ 
+feature_extractor = ViTImageProcessor.from_pretrained(model_name)
+print(model,feature_extractor)
+# %%
 transform = torchvision.transforms.Compose([
-    torchvision.transforms.ToTensor(),
-    torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
+    torchvision.transforms.Resize((224, 224)),  # 调整尺寸为224x224
+    torchvision.transforms.ToTensor(),  # 转换为张量
+    # 使用特征提取器的参数进行标准化
+    torchvision.transforms.Normalize(mean=feature_extractor.image_mean, std=feature_extractor.image_std)
 ])
 tfrecord_path = '/kaggle/input/competitions/tpu-getting-started/tfrecords-jpeg-224x224/train/*'
 dataset = TFRecordToPyTorch(tfrecord_path,transform)
@@ -72,30 +89,6 @@ for batch in train_dataloader:
     plt.axis('off')
     plt.show()
 # %%
-pretrained_net = torchvision.models.resnet50(pretrained=True)
-# %%
-pretrained_net.fc=nn.Linear(pretrained_net.fc.in_features,104)
-nn.init.xavier_uniform_(pretrained_net.fc.weight)
-# %%
-for parm in pretrained_net.conv1.parameters():
-    parm.requires_grad=False
-for parm in pretrained_net.bn1.parameters():
-    parm.requires_grad=False
-for parm in pretrained_net.layer1.parameters():
-    parm.requires_grad=False
-for parm in pretrained_net.layer2.parameters():
-    parm.requires_grad=False
-for parm in pretrained_net.layer3.parameters():
-    parm.requires_grad=False
-# %%
-def print_trainable_info(model):
-        frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total = frozen + trainable
-        print(f"  冻结参数: {frozen:,}  可训练参数: {trainable:,}  ({100.*trainable/total:.1f}%)")
-# %%
-print_trainable_info(pretrained_net)
-# %%
 @torch.no_grad()
 def validate(model,loader):
     model.eval()
@@ -106,20 +99,21 @@ def validate(model,loader):
         labels = batch[1]
         X = X.to(device)
         labels = labels.to(device)
-        pred=torch.argmax(model(X),dim=1)
+        pred=torch.argmax(model(X).logits,dim=1)
         acc+=pred.eq(labels).sum()
         total+=labels.size(0)
     print(f"acc:{acc/total}")
-# %%
+    return acc/total
 from tqdm import tqdm   
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-pretrained_net=pretrained_net.to(device)
+model=model.to(device)
 loss_func = nn.CrossEntropyLoss()
-optimizer = torch.optim.AdamW(pretrained_net.parameters(), lr=2e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4)
 scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
-epochs = 20
+epochs = 10
+best_acc=0.0
 for epoch in range(epochs):
-    pretrained_net.train()
+    model.train()
     training_loss = 0
     
     # 使用 tqdm 包装 dataloader，并设置描述信息
@@ -130,13 +124,13 @@ for epoch in range(epochs):
         X = batch[0].to(device)
         labels = batch[1].to(device)
         
-        outputs = pretrained_net(X)
+        outputs = model(X).logits
         loss = loss_func(outputs, labels)
         loss.backward()
         optimizer.step()
         
         training_loss += loss.item()
-        lens+=labels.size(0)
+        lens+=1
         # 更新进度条显示当前 batch 的损失
         progress_bar.set_postfix({
             'loss': f'{loss.item():.4f}',
@@ -145,13 +139,15 @@ for epoch in range(epochs):
     
     scheduler.step()
     
-    # 计算平均训练损失（注意：len(train_dataloader) 才是 batch 总数）
     avg_train_loss = training_loss / lens
     print(f"Epoch {epoch+1} train_loss: {avg_train_loss:.4f}")
     
     # 验证（你也可以为验证添加进度条，见下方建议）
-    validate(pretrained_net, val_dataloader)
-    
+    current_acc=validate(model, val_dataloader)
+    if current_acc > best_acc :
+        torch.save(model.state_dict(), 'model.pth')
+        print(f"best model save,acc:{current_acc}")
+        best_acc=current_acc
 # %%
 import pandas as pd
 def parse_tfrecord_test(example_proto):
@@ -200,11 +196,13 @@ dataset3 = TFRecordToPyTorchTest(tfrecord_path,transform)
 test_dataloader = DataLoader(dataset3, batch_size=32, num_workers=0)
 id_array=[]
 all_preds=[]
+model.load_state_dict(torch.load('model.pth'))
+model.eval()
 with torch.no_grad():
     for batch in test_dataloader:
         input_ids = batch[0].to(device)
         idd = batch[1]
-        outputs = pretrained_net(input_ids)
+        outputs = model(input_ids).logits
         preds = torch.argmax(outputs, dim=1)
         all_preds.extend(preds.cpu().numpy())
         id_array.extend(idd)
