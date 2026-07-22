@@ -88,8 +88,7 @@ for batch in train_dataloader:
     break
     plt.axis('off')
     plt.show()
-# %%
-!pip install torchao==0.16.0
+
 from peft import LoraConfig, get_peft_model
 
 # 加载预训练模型
